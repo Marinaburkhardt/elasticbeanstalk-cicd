@@ -1,0 +1,87 @@
+stages:
+  - build
+  - artifacts
+  - deploy
+
+variables:
+  AWS_REGION: 'eu-central-1'
+  ENVIRONMENT_NAME: ${CI_PROJECT_NAME}-env
+  APPLICATION_NAME: ${CI_PROJECT_NAME}-app
+  S3_BUCKET: 'test-elasticbeanstalk'
+  S3_KEY: $CI_PROJECT_NAME
+  SOLUTION_STACK: '64bit Amazon Linux 2 v3.1.2 running Corretto 11'
+  APPLICATION_DESCRIPTION: 'Test application'
+  ENVIRONMENT_TIER: 'Name=WebServer,Type=Standard'
+
+.buildEnvironment: &buildEnvironment
+  - EXISTING_ENV=$(aws elasticbeanstalk describe-environments --query "Environments[?ApplicationName=='${APPLICATION_NAME}'][EnvironmentName]" --output text | head -n 1) # To get the last created environment
+  - STATUS_EXISTING_ENV=$(aws elasticbeanstalk describe-environments --query "Environments[?ApplicationName=='${APPLICATION_NAME}'][Status]" --output text | head -n 1)
+  - >
+    if [ "$EXISTING_ENV" == "$ENVIRONMENT_NAME" ] && [ "$STATUS_EXISTING_ENV" == "Ready" ] ; then
+      echo "--- Skipping Elasticbeanstalk init, environment already exist ---"
+    else
+      echo "--- Initializing Elasticbeanstalk ---"
+      echo "--- Creating application ---"
+      aws elasticbeanstalk create-application --application-name $APPLICATION_NAME --description "'$APPLICATION_DESCRIPTION'"
+      sleep 5s
+      echo "--- Creating environment ---"
+      aws elasticbeanstalk create-environment --application-name $APPLICATION_NAME --environment-name $ENVIRONMENT_NAME --tier "$ENVIRONMENT_TIER" --solution-stack-name "$SOLUTION_STACK" --option-settings file://elasticbeanstalk_config.json
+      sleep 5s
+      echo "--- Gathering Elasticbeanstalk environment status ---"
+      HEALTH=$(aws elasticbeanstalk describe-environments --application-name $APPLICATION_NAME --environment-name $ENVIRONMENT_NAME --query "Environments[*].{Health: Health}" --output text | head -n 1)
+      while [ "$HEALTH" != "Green" ]; do
+        echo "Waiting for environment until it's ready to be used..."
+        sleep 1m
+        HEALTH=$(aws elasticbeanstalk describe-environments --application-name $APPLICATION_NAME --environment-name $ENVIRONMENT_NAME --query "Environments[*].{Health: Health}" --output text | head -n 1)
+      done
+    fi
+
+buildApp:
+  image: java:8-jdk
+  stage: build
+  allow_failure: false
+  script:
+    - chmod +x ./gradlew 
+    - echo "--- Building application ---"
+    - ./gradlew clean build shadowJar
+    - mv build/libs/${CI_PROJECT_NAME}-0.1-all.jar ${CI_PROJECT_NAME}.jar
+  artifacts:
+    paths:
+      - ${CI_PROJECT_NAME}.jar
+    expire_in: 20 min
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+
+artifactsSetup:
+  image: python:latest
+  stage: artifacts
+  script:
+    - echo "--- Setting up environment ---"
+    - apt update && apt install -y zip
+    - pip install awscli
+    - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+    - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+    - aws configure set region ${AWS_REGION}
+    - echo "--- Copying artifact to S3 bucket ---"
+    - aws s3 cp ${CI_PROJECT_NAME}.jar s3://${S3_BUCKET}/${S3_KEY}/${APPLICATION_NAME}-$CI_PIPELINE_ID.jar
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+
+deployment:
+  image: python:latest
+  stage: deploy
+  script:
+    - echo "--- Setting up environment ---"
+    - pip install awscli
+    - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+    - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+    - aws configure set region ${AWS_REGION}
+    - *buildEnvironment
+    - echo "--- Deploying application ---"
+    - aws elasticbeanstalk create-application-version --application-name ${APPLICATION_NAME} --version-label ${APPLICATION_NAME}-$CI_PIPELINE_ID --source-bundle S3Bucket=${S3_BUCKET},S3Key=${S3_KEY}/${APPLICATION_NAME}-$CI_PIPELINE_ID.jar
+    - aws elasticbeanstalk update-environment --application-name ${APPLICATION_NAME} --environment-name ${ENVIRONMENT_NAME} --version-label ${APPLICATION_NAME}-$CI_PIPELINE_ID
+  dependencies:
+    - artifactsSetup
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+
